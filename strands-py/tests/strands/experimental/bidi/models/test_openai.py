@@ -30,6 +30,7 @@ from strands.experimental.bidi.types import (
     BidiAudioStopEvent,
     BidiBargeInEvent,
     BidiConnectionStartEvent,
+    BidiMessage,
     BidiResponseStartEvent,
     BidiResponseStopEvent,
     BidiTranscriptDeltaEvent,
@@ -465,13 +466,77 @@ async def test_connection_edge_cases(mock_websockets_connect, api_key, model_id)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocks", "exp_content"),
+    [
+        (
+            [TextBlock("First"), TextBlock("Second")],
+            [{"type": "input_text", "text": "First"}, {"type": "input_text", "text": "Second"}],
+        ),
+        (
+            [
+                TextBlock("Describe this image"),
+                ImageBlock(format="jpeg", source={"bytes": b"image"}),
+                TextBlock("Be brief"),
+            ],
+            [
+                {"type": "input_text", "text": "Describe this image"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,aW1hZ2U="},
+                {"type": "input_text", "text": "Be brief"},
+            ],
+        ),
+    ],
+    ids=["text", "mixed"],
+)
+async def test_send_message_creates_one_message_and_response(mock_websockets_connect, model, blocks, exp_content):
+    _, mock_ws = mock_websockets_connect
+    await model.start()
+    mock_ws.send.reset_mock()
+    try:
+        await model.send(BidiMessage(content=blocks))
+
+        tru_events = [json.loads(call.args[0]) for call in mock_ws.send.await_args_list]
+        exp_events = [
+            {
+                "type": "conversation.item.create",
+                "item": {"id": unittest.mock.ANY, "type": "message", "role": "user", "content": exp_content},
+            },
+            {"type": "response.create"},
+        ]
+        assert tru_events == exp_events
+    finally:
+        await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block", "error_message"),
+    [
+        (ImageBlock(format="jpeg", source={}), "image source must contain bytes"),
+        (AudioDelta(format="pcm", source={"bytes": b"audio"}), "content not supported"),
+    ],
+    ids=["missing-image-bytes", "unsupported-block"],
+)
+async def test_send_message_rejects_invalid_blocks_before_sending(mock_websockets_connect, model, block, error_message):
+    _, mock_ws = mock_websockets_connect
+    await model.start()
+    mock_ws.send.reset_mock()
+    try:
+        with pytest.raises(ValueError, match=error_message):
+            await model.send(BidiMessage(content=[TextBlock("Hello"), block]))
+        mock_ws.send.assert_not_awaited()
+    finally:
+        await model.stop()
+
+
+@pytest.mark.asyncio
 async def test_send_all_content_types(mock_websockets_connect, model):
     """Test sending all content types through unified send() method."""
     _, mock_ws = mock_websockets_connect
     await model.start()
 
     # Test text input
-    assert await model.send(TextBlock("Hello")) is None
+    assert await model.send(BidiMessage(content=[TextBlock("Hello")])) is None
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -480,7 +545,12 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     assert len(response_create) > 0
     assert item_create[-1] == {
         "type": "conversation.item.create",
-        "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+        "item": {
+            "id": unittest.mock.ANY,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        },
     }
 
     # Test audio input
@@ -496,7 +566,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
 
     # Test tool result with text content
     tool_result = ToolResultBlock(tool_use_id="tool-123", status="success", content=[{"text": "Result: 42"}])
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -512,7 +582,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     tool_result_json = ToolResultBlock(
         tool_use_id="tool-456", status="success", content=[{"json": {"result": 42, "status": "ok"}}]
     )
-    await model.send(tool_result_json)
+    await model.send(BidiMessage(content=[tool_result_json]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -529,7 +599,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         status="success",
         content=[{"text": "Part 1"}, {"json": {"data": "value"}}, {"text": "Part 2"}],
     )
-    await model.send(tool_result_multi)
+    await model.send(BidiMessage(content=[tool_result_multi]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -547,7 +617,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         content=[{"image": {"format": "jpeg", "source": {"bytes": b"image_data"}}}],
     )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result_image)
+        await model.send(BidiMessage(content=[tool_result_image]))
 
     # Test tool result with document content (should raise error)
     tool_result_doc = ToolResultBlock(
@@ -556,7 +626,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         content=[{"document": {"format": "pdf", "source": {"bytes": b"doc_data"}}}],
     )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result_doc)
+        await model.send(BidiMessage(content=[tool_result_doc]))
 
     await model.stop()
 
@@ -568,27 +638,29 @@ async def test_send_edge_cases(mock_websockets_connect, model):
 
     # Test send when inactive
     with pytest.raises(RuntimeError, match=r"call start before sending"):
-        await model.send(TextBlock("Hello"))
+        await model.send(BidiMessage(content=[TextBlock("Hello")]))
     mock_ws.send.assert_not_called()
 
     # Test image input (sent as input_image content block on user message)
     await model.start()
     mock_ws.send.reset_mock()
     image_b64 = base64.b64encode(b"image_bytes").decode("utf-8")
-    assert await model.send(ImageBlock(format="jpeg", source={"bytes": b"image_bytes"})) is None
+    assert await model.send(BidiMessage(content=[ImageBlock(format="jpeg", source={"bytes": b"image_bytes"})])) is None
 
-    # Verify exactly one event was sent: a conversation.item.create with input_image
+    # The image is delivered as one conversation item before requesting a response.
     image_calls = [json.loads(call[0][0]) for call in mock_ws.send.call_args_list]
-    image_creates = [m for m in image_calls if m.get("type") == "conversation.item.create"]
-    assert len(image_creates) == 1, "expected exactly one conversation.item.create for image"
-    image_item = image_creates[0].get("item", {})
-    assert image_item == {
-        "type": "message",
-        "role": "user",
-        "content": [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"}],
-    }
-    # Image input must NOT auto-trigger a response — caller decides when to commit.
-    assert not any(m.get("type") == "response.create" for m in image_calls)
+    assert image_calls == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"}],
+            },
+        },
+        {"type": "response.create"},
+    ]
 
     await model.stop()
 
@@ -948,7 +1020,7 @@ def test__build_session_config_merges_params_last(
                 "input": {
                     "format": {"rate": 24000},
                     "transcription": transcription_override,
-                    "turn_detection": {"threshold": 0.3, "prefix_padding_ms": 0, "create_response": False},
+                    "turn_detection": {"threshold": 0.3, "prefix_padding_ms": 0, "create_response": True},
                 },
                 "output": {"format": {"rate": 24000}, "voice": "coral"},
             },
@@ -970,7 +1042,7 @@ def test__build_session_config_merges_params_last(
                     "threshold": 0.3,
                     "prefix_padding_ms": 0,
                     "silence_duration_ms": 500,
-                    "create_response": False,
+                    "create_response": True,
                 },
             },
             "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "coral"},
@@ -997,6 +1069,25 @@ def test__build_session_config_preserves_defaults(model_id, model, api_key, syst
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_detection",
+    [None, {"create_response": False}, {"interrupt_response": False}],
+    ids=["vad-disabled", "automatic-response-disabled", "interruption-disabled"],
+)
+async def test_start_requires_automatic_voice_responses(model, mock_websockets_connect, turn_detection):
+    model.update_config(params={"audio": {"input": {"turn_detection": turn_detection}}})
+
+    with pytest.raises(
+        ValueError, match="requires turn detection with create_response=True and interrupt_response=True"
+    ):
+        await model.start()
+
+    mock_connect, _ = mock_websockets_connect
+    mock_connect.assert_not_called()
+    assert model._connection_id is None
+
+
+@pytest.mark.asyncio
 async def test_start_preserves_explicit_nulls(model_id, api_key, mock_websockets_connect):
     """Session updates preserve explicit null overrides."""
     _, mock_ws = mock_websockets_connect
@@ -1004,7 +1095,7 @@ async def test_start_preserves_explicit_nulls(model_id, api_key, mock_websockets
         model_id=model_id,
         transcription_model_id="gpt-4o-transcribe",
         api_key=api_key,
-        params={"audio": {"input": {"turn_detection": None, "transcription": None}}, "tracing": None},
+        params={"audio": {"input": {"transcription": None}}, "tracing": None},
     )
 
     await model.start(system_prompt="Test instructions")
@@ -1020,7 +1111,12 @@ async def test_start_preserves_explicit_nulls(model_id, api_key, mock_websockets
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
                     "transcription": None,
-                    "turn_detection": None,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                    },
                 },
                 "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "alloy"},
             },
@@ -1206,7 +1302,7 @@ async def test_tool_result_single_text_content(model_id, mock_websockets_connect
 
     tool_result = ToolResultBlock(tool_use_id="call-123", status="success", content=[{"text": "Simple text result"}])
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1235,7 +1331,7 @@ async def test_tool_result_single_json_content(model_id, mock_websockets_connect
         tool_use_id="call-456", status="success", content=[{"json": {"temperature": 72, "condition": "sunny"}}]
     )
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1269,7 +1365,7 @@ async def test_tool_result_multiple_content_blocks(model_id, mock_websockets_con
         ],
     )
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1304,7 +1400,7 @@ async def test_tool_result_image_content_raises_error(model_id, mock_websockets_
     )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result)
+        await model.send(BidiMessage(content=[tool_result]))
 
     await model.stop()
 
@@ -1323,7 +1419,7 @@ async def test_tool_result_document_content_raises_error(model_id, mock_websocke
     )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result)
+        await model.send(BidiMessage(content=[tool_result]))
 
     await model.stop()
 
@@ -1586,28 +1682,40 @@ async def test_tool_results_wait_for_response_and_entire_group(model, mock_webso
     reader = model.receive()
     await anext(reader)  # Connection start.
 
-    await model.send(result_b)
+    await model.send(BidiMessage(content=[result_b]))
     assert await anext(reader) == BidiResponseStopEvent("response-a")
     await model._flush_response_request(state)
-    assert [json.loads(call.args[0]) for call in mock_websocket.send.call_args_list] == [
+    tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+    exp_events = [
         {
             "type": "conversation.item.create",
-            "item": {"type": "function_call_output", "call_id": "b", "output": json.dumps([{"text": "B"}])},
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "function_call_output",
+                "call_id": "b",
+                "output": json.dumps([{"text": "B"}]),
+            },
         }
     ]
-    await model.send(result_a)
+    assert tru_events == exp_events
+
+    await model.send(BidiMessage(content=[result_a]))
     await model._flush_response_request(state)
-    assert [json.loads(call.args[0]) for call in mock_websocket.send.call_args_list] == [
+    tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+    exp_events += [
         {
             "type": "conversation.item.create",
-            "item": {"type": "function_call_output", "call_id": "b", "output": json.dumps([{"text": "B"}])},
-        },
-        {
-            "type": "conversation.item.create",
-            "item": {"type": "function_call_output", "call_id": "a", "output": json.dumps([{"text": "A"}])},
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "function_call_output",
+                "call_id": "a",
+                "output": json.dumps([{"text": "A"}]),
+            },
         },
         {"type": "response.create"},
     ]
+    assert tru_events == exp_events
+
     assert await anext(reader) == BidiResponseStartEvent("response-b")
     assert await anext(reader) == BidiResponseStopEvent("response-b")
     await reader.aclose()
@@ -1666,3 +1774,62 @@ async def test_history_acknowledgment_is_not_new_input(model, mock_websocket):
         BidiResponseStartEvent("new")
     ]
     await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block",
+    [
+        TextBlock("Also consider this."),
+        ToolResultBlock(tool_use_id="call", status="success", content=[{"text": "Result"}]),
+    ],
+    ids=["text", "tool"],
+)
+@pytest.mark.parametrize("acknowledged_before_response", [True, False], ids=["early-ack", "late-ack"])
+async def test_receive_defers_response_during_speech(model, mock_websocket, block, acknowledged_before_response):
+    model.update_config(params={"audio": {"input": {"transcription": None}}})
+    await model.start()
+    mock_websocket.send.reset_mock()
+    state = model._session_state
+    state.active_responses.add("previous")
+    mock_websocket.recv.return_value = json.dumps({"type": "input_audio_buffer.speech_started", "item_id": "speech"})
+
+    reader = model.receive()
+    try:
+        await anext(reader)
+        assert await anext(reader) == BidiBargeInEvent("user_speech")
+
+        await model.send(BidiMessage(content=[block]))
+        mock_websocket.send.assert_awaited_once()
+        input_event = json.loads(mock_websocket.send.call_args.args[0])
+        acknowledgment = {"type": "conversation.item.added", "item": input_event["item"]}
+        response = {"type": "response.created", "response": {"id": "answer"}}
+        response_events = [acknowledgment, response] if acknowledged_before_response else [response, acknowledgment]
+        native_events = [
+            {"type": "response.done", "response": {"id": "previous"}},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "speech"},
+            {"type": "input_audio_buffer.committed", "item_id": "speech"},
+            *response_events,
+            {"type": "response.done", "response": {"id": "answer"}},
+        ]
+        mock_websocket.recv.side_effect = [json.dumps(event) for event in native_events]
+
+        exp_events = [
+            BidiResponseStopEvent("previous"),
+            BidiResponseStartEvent("answer"),
+            BidiResponseStopEvent("answer"),
+        ]
+        tru_events = [await anext(reader) for _ in exp_events]
+        assert tru_events == exp_events
+        mock_websocket.send.assert_awaited_once()
+
+        await model._flush_response_request(state)
+
+        tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+        exp_events = [input_event]
+        if not acknowledged_before_response:
+            exp_events.append({"type": "response.create"})
+        assert tru_events == exp_events
+    finally:
+        await reader.aclose()
+        await model.stop()
